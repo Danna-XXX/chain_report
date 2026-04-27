@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 项目私有配置
+DASHSCOPE_API_KEY
+.api_key
+temp/
