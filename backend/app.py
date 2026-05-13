@@ -9,11 +9,11 @@ import shutil
 import uuid
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
 
 try:
-    from backend.services.llm_client import LLMConfig, llm_enabled
+    from backend.services.llm_client import LLMConfig, active_models, llm_enabled
     from backend.services.material_parser import summarize_private_materials, summarize_structured_files
     from backend.services.report_catalog import (
         build_catalog_payload,
@@ -21,10 +21,10 @@ try:
         get_output_filename,
         normalize_outline,
     )
-    from backend.services.report_engine import build_report
+    from backend.services.report_engine import build_report, build_report_stream
     from backend.services.web_search import search_for_report
 except ImportError:
-    from services.llm_client import LLMConfig, llm_enabled
+    from services.llm_client import LLMConfig, active_models, llm_enabled
     from services.material_parser import summarize_private_materials, summarize_structured_files
     from services.report_catalog import (
         build_catalog_payload,
@@ -32,7 +32,7 @@ except ImportError:
         get_output_filename,
         normalize_outline,
     )
-    from services.report_engine import build_report
+    from services.report_engine import build_report, build_report_stream
     from services.web_search import search_for_report
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -91,27 +91,34 @@ def config():
 
 @app.route("/api/status")
 def status():
-    cfg = LLMConfig()
+    models = active_models()
     return jsonify({
         "status": "running",
         "version": "3.0.0",
         "llm": {
             "enabled": llm_enabled(),
-            "model": cfg.model,
-            "base_url": cfg.base_url,
-            "temperature": cfg.temperature,
+            "generation_model": models.get("generation"),
+            "structured_model": models.get("structured"),
         },
         "features": [
+            "planner_executor_critic",
+            "inter_section_context",
             "llm_paragraph_generation",
-            "web_search_context",
+            "web_search_tavily",
+            "url_content_extraction",
             "multi_report_generation",
             "editable_outline",
             "structured_file_upload",
             "private_material_upload",
             "markdown_preview_download",
+            "sse_streaming",
         ],
     })
 
+
+# ─────────────────────────────────────────────
+# Original synchronous endpoint (backward compatible)
+# ─────────────────────────────────────────────
 
 @app.route("/api/generate", methods=["POST"])
 def generate():
@@ -139,7 +146,6 @@ def generate():
             report_type, version = key.split(":", 1)
             outline = custom_outlines[key]
 
-            # Web search
             web_data = None
             if enable_web:
                 try:
@@ -182,6 +188,90 @@ def generate():
     finally:
         if session_dir.exists():
             shutil.rmtree(session_dir, ignore_errors=True)
+
+
+# ─────────────────────────────────────────────
+# Streaming SSE endpoint
+# ─────────────────────────────────────────────
+
+@app.route("/api/generate/stream", methods=["POST"])
+def generate_stream():
+    target = request.form.get("target", "").strip()
+    type_param = request.form.get("type", "")
+    enable_web = request.form.get("enable_web_search", "true").lower() == "true"
+    selected_keys = _parse_versions(type_param)
+    custom_outlines = _parse_outlines(request.form.get("custom_outlines", ""), selected_keys)
+
+    if not target:
+        def _err():
+            yield f"data: {json.dumps({'type': 'error', 'msg': '请填写产业链或公司名称。'}, ensure_ascii=False)}\n\n"
+        return Response(stream_with_context(_err()), mimetype="text/event-stream")
+
+    if not selected_keys:
+        def _err():
+            yield f"data: {json.dumps({'type': 'error', 'msg': '请至少选择一个报告版本。'}, ensure_ascii=False)}\n\n"
+        return Response(stream_with_context(_err()), mimetype="text/event-stream")
+
+    session_dir = TEMP_DIR / str(uuid.uuid4())
+
+    # Save uploaded files eagerly (before streaming starts)
+    try:
+        structured_files = _save_files(request.files.getlist("files"), session_dir / "structured")
+        private_files = _save_files(request.files.getlist("private_files"), session_dir / "private")
+        structured_summary = summarize_structured_files(structured_files, target)
+        private_summary = summarize_private_materials(private_files, target)
+    except Exception as exc:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        def _err():
+            yield f"data: {json.dumps({'type': 'error', 'msg': f'文件处理失败：{exc}'}, ensure_ascii=False)}\n\n"
+        return Response(stream_with_context(_err()), mimetype="text/event-stream")
+
+    def event_stream():
+        try:
+            for report_idx, key in enumerate(selected_keys):
+                report_type, version = key.split(":", 1)
+                outline = custom_outlines[key]
+
+                if len(selected_keys) > 1:
+                    yield f"data: {json.dumps({'type': 'report_start', 'idx': report_idx + 1, 'total': len(selected_keys), 'key': key}, ensure_ascii=False)}\n\n"
+
+                # Web search
+                web_data = None
+                if enable_web:
+                    yield f"data: {json.dumps({'type': 'stage', 'stage': 'searching', 'msg': f'正在联网检索：{target}…'}, ensure_ascii=False)}\n\n"
+                    try:
+                        web_data = search_for_report(target, outline, report_type)
+                    except Exception:
+                        web_data = None
+
+                for event in build_report_stream(
+                    report_type=report_type,
+                    version=version,
+                    target=target,
+                    outline=outline,
+                    structured_summary=structured_summary,
+                    private_summary=private_summary,
+                    web_search_data=web_data,
+                ):
+                    # Skip the internal searching stage (already emitted above)
+                    if event.get("type") == "stage" and event.get("stage") == "searching":
+                        continue
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'msg': f'生成失败：{exc}'}, ensure_ascii=False)}\n\n"
+        finally:
+            shutil.rmtree(session_dir, ignore_errors=True)
+
+    return Response(
+        stream_with_context(event_stream()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 if __name__ == "__main__":

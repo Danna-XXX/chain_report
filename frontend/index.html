@@ -13,11 +13,12 @@
   .card { border: none; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.08); margin-bottom: 20px; }
   .card-header { background: white; border-bottom: 2px solid #f0f0f0; border-radius: 12px 12px 0 0 !important;
                  font-weight: 600; color: #1a237e; padding: 16px 20px; }
-  .badge-llm  { background: #e3f2fd; color: #1565c0; font-size: .75rem; padding: 4px 8px; border-radius: 20px; }
-  .badge-rule { background: #fff3e0; color: #e65100; font-size: .75rem; padding: 4px 8px; border-radius: 20px; }
-  .section-tag { display:inline-block; padding:2px 8px; border-radius:10px; font-size:.75rem; margin:2px; }
-  .s-llm  { background:#e8f5e9; color:#2e7d32; }
-  .s-rule { background:#fff8e1; color:#f57f17; }
+  .badge-llm     { background: #e3f2fd; color: #1565c0; font-size: .75rem; padding: 4px 8px; border-radius: 20px; }
+  .badge-rule    { background: #fff3e0; color: #e65100; font-size: .75rem; padding: 4px 8px; border-radius: 20px; }
+  .section-tag   { display:inline-block; padding:2px 8px; border-radius:10px; font-size:.75rem; margin:2px; }
+  .s-llm         { background:#e8f5e9; color:#2e7d32; }
+  .s-llm_revised { background:#fff3e0; color:#e65100; }
+  .s-rule        { background:#fff8e1; color:#f57f17; }
   #report-preview { background: #fff; border: 1px solid #e0e0e0; border-radius: 8px;
                     padding: 28px; min-height: 200px; white-space: pre-wrap; font-size: .9rem;
                     line-height: 1.8; max-height: 70vh; overflow-y: auto; }
@@ -31,6 +32,14 @@
   .outline-list li button { border: none; background: none; color: #e53935; cursor: pointer; font-size: 1rem; }
   .alert-key { background: #fff3e0; border: 1px solid #ffcc80; border-radius: 8px; padding: 12px 16px;
                font-size: .85rem; color: #e65100; }
+
+  /* Progress log */
+  #progress-log { font-size: .82rem; line-height: 1.7; color: #444; }
+  .log-stage    { color: #1565c0; font-weight: 600; }
+  .log-section  { color: #2e7d32; }
+  .log-revision { color: #e65100; }
+  .log-done     { color: #555; }
+  .log-error    { color: #c62828; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -38,14 +47,14 @@
 <div class="header">
   <div class="container">
     <h1>产业链报告智能体 V3</h1>
-    <p>LLM 逐节生成 · 联网检索增强 · 段落形式专业报告</p>
+    <p>Planner-Executor-Critic · 双 LLM 分工 · Tavily 联网检索 · 实时流式生成</p>
   </div>
 </div>
 
 <div class="container mt-4">
   <div id="llm-alert" class="alert-key mb-3" style="display:none">
     ⚠️ 未检测到 API Key，将使用规则模式生成（报告内容为模板文字）。
-    请在项目根目录创建 <code>DASHSCOPE_API_KEY</code> 文件，填入阿里云 DashScope API Key，再重启服务。
+    请在项目根目录创建 <code>SILICONFLOW_API_KEY</code> 或 <code>DASHSCOPE_API_KEY</code> 文件，再重启服务。
   </div>
 
   <div class="row">
@@ -68,7 +77,7 @@
           <div class="mb-3 form-check">
             <input type="checkbox" class="form-check-input" id="enable-web" checked>
             <label class="form-check-label" for="enable-web">
-              启用联网检索（为 LLM 提供行业最新信息）
+              启用联网检索（Tavily 搜索 + 正文抓取）
             </label>
           </div>
         </div>
@@ -111,17 +120,22 @@
           <div id="result-badges" class="d-flex gap-2 flex-wrap"></div>
         </div>
         <div class="card-body">
-          <div id="loading" style="display:none" class="text-center py-4">
-            <div class="spinner-border text-primary" role="status"></div>
-            <span class="spinner-text" id="loading-msg">正在生成，请稍候（联网+LLM逐节生成需1-3分钟）…</span>
+          <!-- Progress area -->
+          <div id="loading" style="display:none" class="mb-3">
+            <div class="d-flex align-items-center mb-2">
+              <div class="spinner-border spinner-border-sm text-primary" role="status"></div>
+              <span class="spinner-text" id="loading-msg">正在初始化…</span>
+            </div>
+            <div id="progress-log" class="border rounded p-2 bg-light" style="max-height:180px;overflow-y:auto;font-family:monospace"></div>
           </div>
+
           <div id="result-tabs" style="display:none">
             <ul class="nav nav-tabs mb-3" id="report-tab-nav"></ul>
           </div>
           <pre id="report-preview" class="d-none"></pre>
           <div id="placeholder" class="text-center text-muted py-5">
             <div style="font-size:3rem">📄</div>
-            <p>填写右侧信息后点击"生成报告"</p>
+            <p>填写左侧信息后点击"生成报告"</p>
           </div>
           <div id="dl-area" class="mt-3 d-flex gap-2 flex-wrap" style="display:none!important"></div>
         </div>
@@ -171,7 +185,6 @@ function renderVersionList() {
       container.appendChild(div);
     }
   }
-  // Default: check chain_entirety:no_data
   const def = document.getElementById('v-chain_entirety-no_data');
   if (def) { def.checked = true; renderOutlines(); }
 }
@@ -205,8 +218,7 @@ function renderOutlines() {
 }
 
 function removeSection(key, idx) {
-  const listId = 'list-' + key.replace(':','-');
-  const list = document.getElementById(listId);
+  const list = document.getElementById('list-' + key.replace(':','-'));
   if (!list) return;
   const items = list.querySelectorAll('li');
   if (items[idx]) items[idx].remove();
@@ -214,8 +226,7 @@ function removeSection(key, idx) {
 }
 
 function addSection(key) {
-  const listId = 'list-' + key.replace(':','-');
-  const list = document.getElementById(listId);
+  const list = document.getElementById('list-' + key.replace(':','-'));
   if (!list) return;
   const idx = list.querySelectorAll('li').length;
   const li = document.createElement('li');
@@ -238,8 +249,7 @@ function getCustomOutlines() {
   const result = {};
   const selected = getSelectedVersions();
   for (const key of selected) {
-    const listId = 'list-' + key.replace(':','-');
-    const list = document.getElementById(listId);
+    const list = document.getElementById('list-' + key.replace(':','-'));
     if (!list) continue;
     result[key] = [...list.querySelectorAll('input[type=text]')].map(el => el.value.trim()).filter(Boolean);
   }
@@ -251,13 +261,32 @@ function toggleOutlineEditor() {
   el.style.display = el.style.display === 'none' || !el.style.display ? 'block' : 'none';
 }
 
+// ─── Progress log helpers ───────────────────────────────────────────────────
+
+function logLine(cls, text) {
+  const log = document.getElementById('progress-log');
+  const line = document.createElement('div');
+  line.className = cls;
+  line.textContent = text;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+function setLoadingMsg(text) {
+  document.getElementById('loading-msg').textContent = text;
+}
+
+// ─── Main generate (SSE streaming) ─────────────────────────────────────────
+
 async function generate() {
   const target = document.getElementById('target').value.trim();
   const selected = getSelectedVersions();
   if (!target) { alert('请填写分析对象名称'); return; }
   if (!selected.length) { alert('请至少选择一个报告类型'); return; }
 
+  // Reset UI
   document.getElementById('loading').style.display = 'block';
+  document.getElementById('progress-log').innerHTML = '';
   document.getElementById('placeholder').style.display = 'none';
   document.getElementById('report-preview').classList.add('d-none');
   document.getElementById('result-tabs').style.display = 'none';
@@ -265,6 +294,7 @@ async function generate() {
   document.getElementById('sections-card').style.display = 'none';
   document.getElementById('result-badges').innerHTML = '';
   document.getElementById('btn-generate').disabled = true;
+  currentResults = [];
 
   const fd = new FormData();
   fd.append('target', target);
@@ -277,29 +307,127 @@ async function generate() {
   for (const f of sFiles) fd.append('files', f);
   for (const f of pFiles) fd.append('private_files', f);
 
+  setLoadingMsg('正在连接服务器…');
+
   try {
-    const res = await fetch('/api/generate', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!data.success) { alert(data.message || '生成失败'); return; }
-    currentResults = data.results || [];
-    renderResults(currentResults);
+    const response = await fetch('/api/generate/stream', { method: 'POST', body: fd });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Parse SSE lines
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // keep incomplete last line
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (!raw) continue;
+        let event;
+        try { event = JSON.parse(raw); } catch { continue; }
+        handleEvent(event);
+      }
+    }
   } catch(e) {
-    alert('请求失败：' + e.message);
+    logLine('log-error', '请求失败：' + e.message);
+    setLoadingMsg('生成失败');
   } finally {
     document.getElementById('loading').style.display = 'none';
     document.getElementById('btn-generate').disabled = false;
   }
 }
 
+function handleEvent(event) {
+  switch (event.type) {
+    case 'stage':
+      setLoadingMsg(event.msg);
+      logLine('log-stage', '▶ ' + event.msg);
+      break;
+
+    case 'report_start':
+      logLine('log-stage', `── 报告 ${event.idx}/${event.total}：${event.key} ──`);
+      break;
+
+    case 'section_start':
+      setLoadingMsg(`[${event.idx}/${event.total}] 正在写：${event.title}…`);
+      logLine('log-section', `  [${event.idx}/${event.total}] 撰写中：${event.title}`);
+      break;
+
+    case 'section_done': {
+      // Update the last log line to show done
+      const log = document.getElementById('progress-log');
+      const lines = log.querySelectorAll('.log-section');
+      if (lines.length) lines[lines.length-1].textContent += ' ✓';
+      // Progressive render: show partial report
+      showPartialContent(event.content, event.title);
+      break;
+    }
+
+    case 'revision':
+      logLine('log-revision', `  ↻ Critic 修订第 ${event.idx} 节：${event.title}`);
+      break;
+
+    case 'complete':
+      handleComplete(event);
+      break;
+
+    case 'error':
+      logLine('log-error', '错误：' + event.msg);
+      break;
+  }
+}
+
+let partialSections = [];
+
+function showPartialContent(content, title) {
+  partialSections.push({ title, content });
+  const preview = document.getElementById('report-preview');
+  preview.textContent = partialSections.map(s => `## ${s.title}\n\n${s.content}`).join('\n\n---\n\n');
+  preview.classList.remove('d-none');
+}
+
+function handleComplete(event) {
+  partialSections = [];
+  logLine('log-done', `✓ 完成，耗时 ${event.elapsed_sec}s${event.web_search_ok ? ' · 联网✓' : ''}`);
+
+  const result = {
+    filename: event.filename,
+    content: event.markdown,
+    llm_used: event.llm_used,
+    elapsed_sec: event.elapsed_sec,
+    sections_meta: event.sections_meta || [],
+    web_search_ok: event.web_search_ok,
+    critic_revisions: event.critic_revisions || [],
+  };
+
+  // Check if this is part of a multi-report stream
+  const existing = currentResults.findIndex(r => r.filename === event.filename);
+  if (existing >= 0) {
+    currentResults[existing] = result;
+  } else {
+    currentResults.push(result);
+  }
+
+  renderResults(currentResults);
+}
+
 function renderResults(results) {
   const tabNav = document.getElementById('report-tab-nav');
-  const preview = document.getElementById('report-preview');
   const badges = document.getElementById('result-badges');
 
   tabNav.innerHTML = '';
   badges.innerHTML = '';
 
-  if (results.length === 0) return;
+  if (!results.length) return;
 
   if (results.length === 1) {
     document.getElementById('result-tabs').style.display = 'none';
@@ -315,7 +443,6 @@ function renderResults(results) {
     showReport(results[0]);
   }
 
-  // Badges
   results.forEach(r => {
     const b = document.createElement('span');
     b.className = r.llm_used ? 'badge-llm' : 'badge-rule';
@@ -323,7 +450,6 @@ function renderResults(results) {
     badges.appendChild(b);
   });
 
-  // Web badge
   if (results[0]?.web_search_ok) {
     const wb = document.createElement('span');
     wb.className = 'badge-llm';
@@ -344,23 +470,26 @@ function showReport(r) {
   preview.textContent = r.content;
   preview.classList.remove('d-none');
 
-  // Download button
   const dlArea = document.getElementById('dl-area');
+  const idx = currentResults.indexOf(r);
   dlArea.innerHTML = `
-    <button class="btn btn-success btn-sm" onclick="download('${r.filename}', ${currentResults.indexOf(r)})">
+    <button class="btn btn-success btn-sm" onclick="download('${r.filename}', ${idx})">
       ⬇ 下载 ${r.filename}
     </button>`;
   dlArea.style.cssText = '';
 
-  // Sections detail
   if (r.sections_meta && r.sections_meta.length) {
     const card = document.getElementById('sections-card');
     const detail = document.getElementById('sections-detail');
-    detail.innerHTML = r.sections_meta.map(s =>
-      `<span class="section-tag ${s.source==='llm'?'s-llm':'s-rule'}" title="${s.source}">
-        ${s.index}. ${s.title}
-       </span>`
-    ).join('');
+    detail.innerHTML = r.sections_meta.map(s => {
+      const cls = s.source === 'llm' ? 's-llm'
+                : s.source === 'llm_revised' ? 's-llm_revised'
+                : 's-rule';
+      const label = s.source === 'llm_revised' ? '↻修订' : s.source === 'llm' ? 'LLM' : '规则';
+      return `<span class="section-tag ${cls}" title="${s.source}">
+        ${s.index}. ${s.title} <small>${label}</small>
+      </span>`;
+    }).join('');
     card.style.display = 'block';
   }
 }

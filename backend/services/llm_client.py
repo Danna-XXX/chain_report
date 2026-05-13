@@ -1,4 +1,8 @@
-"""LLM client — DashScope OpenAI-compatible endpoint."""
+"""LLM client — dual LLM routing.
+
+Structured tasks (Planner, Critic, Summarizer): SiliconFlow GLM-5.1 (primary) → DashScope Qwen (fallback)
+Long-form generation (Executor): DashScope Qwen (primary) → SiliconFlow GLM-5.1 (fallback)
+"""
 
 from __future__ import annotations
 
@@ -9,8 +13,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from .key_loader import load_key
+
+
+# ─────────────────────────────────────────────
+# Config classes
+# ─────────────────────────────────────────────
 
 class LLMConfig:
+    """DashScope / Qwen — primary for long-form generation."""
+
     def __init__(self) -> None:
         self.base_url = os.getenv(
             "REPORT_AGENT_BASE_URL",
@@ -21,27 +33,28 @@ class LLMConfig:
         self.max_tokens = int(os.getenv("REPORT_AGENT_MAX_TOKENS", "3000"))
         self.timeout_sec = int(os.getenv("REPORT_AGENT_TIMEOUT_SEC", "90"))
         self.retries = int(os.getenv("REPORT_AGENT_RETRIES", "2"))
-        self.api_key = self._load_api_key()
+        self.api_key = load_key("aliyun_api_key", env_var="REPORT_AGENT_API_KEY")
 
-    @staticmethod
-    def _read_file(path: Path) -> str:
-        try:
-            return path.read_text(encoding="utf-8").strip()
-        except Exception:
-            return ""
 
-    def _load_api_key(self) -> str:
-        env_key = os.getenv("REPORT_AGENT_API_KEY", "").strip()
-        if env_key:
-            return env_key
-        # Look for key file in project root (parent of backend/)
-        project_root = Path(__file__).resolve().parent.parent.parent
-        for name in ("DASHSCOPE_API_KEY", ".api_key"):
-            key = self._read_file(project_root / name)
-            if key:
-                return key
-        return ""
+class SiliconFlowConfig:
+    """SiliconFlow GLM-5.1 — primary for structured tasks (Planner / Critic / Summarizer)."""
 
+    BASE_URL = "https://api.siliconflow.cn/v1"
+    MODEL = "Pro/zai-org/GLM-5.1"
+
+    def __init__(self) -> None:
+        self.base_url = self.BASE_URL
+        self.model = self.MODEL
+        self.temperature = 0.3
+        self.max_tokens = 2000
+        self.timeout_sec = 60
+        self.retries = 1
+        self.api_key = load_key("siliconflow_api_key", env_var="SILICONFLOW_API_KEY")
+
+
+# ─────────────────────────────────────────────
+# Low-level HTTP
+# ─────────────────────────────────────────────
 
 def _post_json(url: str, headers: dict, payload: dict, timeout_sec: int) -> dict:
     data = json.dumps(payload).encode("utf-8")
@@ -51,10 +64,10 @@ def _post_json(url: str, headers: dict, payload: dict, timeout_sec: int) -> dict
         return json.loads(body)
 
 
-def chat_completion(system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> dict:
-    cfg = LLMConfig()
+def _call_config(cfg, system_prompt: str, user_prompt: str, max_tokens: int | None) -> dict:
+    """Single attempt to call one LLM config. Returns standardized result dict."""
     if not cfg.api_key:
-        return {"ok": False, "error": "missing_api_key", "content": "", "usage": {}}
+        return {"ok": False, "error": "missing_api_key", "content": "", "usage": {}, "model": cfg.model}
 
     url = cfg.base_url.rstrip("/") + "/chat/completions"
     headers = {
@@ -90,16 +103,71 @@ def chat_completion(system_prompt: str, user_prompt: str, max_tokens: int | None
             last_error = f"http_{exc.code}"
         except Exception as exc:
             last_error = str(exc)
-        time.sleep(0.8 * (attempt + 1))
+        if attempt < cfg.retries:
+            time.sleep(0.8 * (attempt + 1))
 
-    return {"ok": False, "error": last_error or "request_failed", "content": "", "usage": {}}
+    return {"ok": False, "error": last_error or "request_failed", "content": "", "usage": {}, "model": cfg.model}
+
+
+# ─────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────
+
+def chat_completion(system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> dict:
+    """Long-form generation: Qwen primary → GLM-5.1 fallback."""
+    primary = LLMConfig()
+    result = _call_config(primary, system_prompt, user_prompt, max_tokens)
+    if result.get("ok") and result.get("content", "").strip():
+        return result
+
+    # Fallback to SiliconFlow if primary failed for a non-key reason
+    if result.get("error") != "missing_api_key":
+        fallback = SiliconFlowConfig()
+        if fallback.api_key:
+            fb_result = _call_config(fallback, system_prompt, user_prompt, max_tokens)
+            if fb_result.get("ok") and fb_result.get("content", "").strip():
+                return fb_result
+
+    return result
+
+
+def chat_completion_structured(system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> dict:
+    """Structured tasks (Planner, Critic, Summarizer): GLM-5.1 primary → Qwen fallback."""
+    primary = SiliconFlowConfig()
+    result = _call_config(primary, system_prompt, user_prompt, max_tokens)
+    if result.get("ok") and result.get("content", "").strip():
+        return result
+
+    # Fallback to DashScope
+    if result.get("error") != "missing_api_key":
+        fallback = LLMConfig()
+        if fallback.api_key:
+            fb_result = _call_config(fallback, system_prompt, user_prompt, max_tokens)
+            if fb_result.get("ok") and fb_result.get("content", "").strip():
+                return fb_result
+
+    return result
 
 
 def llm_enabled() -> bool:
-    key = LLMConfig().api_key
-    # Accept keys that look like real API keys (sk- prefix or long alphanumeric strings)
-    if not key:
-        return False
-    if key.startswith("请将") or key.startswith("请在") or "替换" in key or "API Key" in key:
-        return False
-    return len(key) > 10
+    qwen_key = LLMConfig().api_key
+    sf_key = SiliconFlowConfig().api_key
+
+    def _valid(key: str) -> bool:
+        if not key:
+            return False
+        if key.startswith("请将") or key.startswith("请在") or "替换" in key or "API Key" in key:
+            return False
+        return len(key) > 10
+
+    return _valid(qwen_key) or _valid(sf_key)
+
+
+def active_models() -> dict:
+    """Return which models are available, for status endpoint."""
+    qwen = LLMConfig()
+    sf = SiliconFlowConfig()
+    return {
+        "generation": qwen.model if qwen.api_key else (sf.model if sf.api_key else None),
+        "structured": sf.model if sf.api_key else (qwen.model if qwen.api_key else None),
+    }
